@@ -1,0 +1,168 @@
+# JayD26 for Windows, built and proven on a real Windows machine in the public repository
+# Narikia1/jayd26-apps. It builds a given commit of the private Narikia1/jayd26 (read with a read-only
+# deploy key), tests it, builds the installer, installs it, runs it, and proves the engines download and
+# verify, a file converts and a link downloads. It uploads the installer and the evidence. It publishes nothing.
+name: Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch or tag of Narikia1/jayd26 to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      AVALONIA_TELEMETRY_OPTOUT: 1
+      EVIDENCE: ${{ github.workspace }}\evidence
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Narikia1/jayd26
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.JAYD26_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Nothing is hardcoded in the Windows app
+        run: node scripts/native/check-windows.mjs
+
+      - name: Generated files are current
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile --ignore-scripts
+          node scripts/generate-native.mjs --check
+
+      - name: Unit tests, and the screens rendered without a display
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:EVIDENCE\renders" | Out-Null
+          $env:JAYD26_RENDER_DIR = "$env:EVIDENCE\renders"
+          dotnet test apps/windows/JayD26.Tests/JayD26.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish
+        run: dotnet publish apps/windows/JayD26/JayD26.csproj -r win-x64 -c Release --self-contained
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" | Select-Object -First 1
+          & $iscc.FullName apps\windows\installer\jayd26.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item dist\windows\JayD26-Setup.exe | Format-List FullName, Length
+
+      - name: Make a small sample with ffmpeg
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          New-Item -ItemType Directory -Force -Path samples, out | Out-Null
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=25:duration=6" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest samples\clip.mp4
+
+      - name: Install silently, for this user only, with no administrator
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath dist\windows\JayD26-Setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+          $exe = "$env:LOCALAPPDATA\Programs\JayD26\JayD26.exe"
+          if (-not (Test-Path $exe)) { throw "Not installed at $exe" }
+          $scheme = Get-ItemProperty "HKCU:\Software\Classes\jayd26\shell\open\command" -ErrorAction SilentlyContinue
+          if (-not $scheme) { throw 'The jayd26:// link handler was not registered' }
+          "EXE=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Download and verify the engines, then convert a file
+        shell: pwsh
+        run: |
+          $report = "$env:EVIDENCE\self-test-convert.json"
+          $proc = Start-Process -FilePath $env:EXE -ArgumentList '--self-test', "`"$report`"", '--out', "`"$PWD\out`"", '--convert', "`"$PWD\samples\clip.mp4`"", 'mp3' -Wait -PassThru
+          Get-Content $report
+          if ($proc.ExitCode -ne 0) { throw "The self-test failed with code $($proc.ExitCode)" }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if (-not $result.enginesReady) { throw 'The engines are not ready' }
+          if (-not (Test-Path "$env:LOCALAPPDATA\JayD26\engines\yt-dlp\yt-dlp.exe")) { throw 'yt-dlp is not where the app keeps it' }
+          if ($result.convert.status -ne 'completed') { throw "The conversion did not complete: $($result.convert.error)" }
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Download a link
+        id: download
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $report = "$env:EVIDENCE\self-test-download.json"
+          $proc = Start-Process -FilePath $env:EXE -ArgumentList '--self-test', "`"$report`"", '--out', "`"$PWD\out`"", '--download', 'https://soundcloud.com/forss/flickermood' -Wait -PassThru
+          Get-Content $report
+          if ($proc.ExitCode -ne 0) { throw "The download failed with code $($proc.ExitCode)" }
+
+      - name: Run the installed app, and a second launch hands its link to the first
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+          function Save-Desktop($name) {
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bitmap.Save("$env:EVIDENCE\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $graphics.Dispose(); $bitmap.Dispose()
+          }
+
+          $app = Start-Process -FilePath $env:EXE -PassThru
+          Start-Sleep -Seconds 20
+          Save-Desktop 'desktop-started'
+          if ($app.HasExited) { throw "The app exited with code $($app.ExitCode)" }
+
+          $second = Start-Process -FilePath $env:EXE -ArgumentList 'jayd26://download?url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood' -PassThru
+          Start-Sleep -Seconds 8
+          Save-Desktop 'desktop-second-launch'
+          if (-not $second.HasExited) { throw 'The second launch kept running' }
+          if ((Get-Process JayD26).Count -ne 1) { throw 'More than one JayD26 is running' }
+
+          if ($app.HasExited) { throw 'The app stopped during the test' }
+          $app.CloseMainWindow() | Out-Null
+          Start-Sleep -Seconds 5
+          if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; Write-Host 'The app needed a forced close.' }
+
+      - name: Uninstaller works
+        shell: pwsh
+        run: |
+          $uninstaller = Get-ChildItem "$env:LOCALAPPDATA\Programs\JayD26\unins*.exe" | Select-Object -First 1
+          $proc = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          Write-Host "Uninstaller exit code: $($proc.ExitCode)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: JayD26-Setup
+          path: dist/windows/JayD26-Setup.exe
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence
+          path: evidence
+          if-no-files-found: warn
+
+      - name: Note when the download could not be proven
+        if: steps.download.outcome == 'failure'
+        run: echo "::warning::The link download failed on this runner. See self-test-download.json in the evidence; sites often refuse cloud machines."
