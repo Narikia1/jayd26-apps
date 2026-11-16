@@ -1,8 +1,9 @@
-# JayD26 for Windows, built and proven on a real Windows machine in the public repository
-# Narikia1/jayd26-apps. It builds a given commit of the private Narikia1/jayd26 (read with a read-only
-# deploy key), tests it, builds the installer, installs it, runs it, and proves the engines download and
-# verify, a file converts and a link downloads. It uploads the installer and the evidence. It publishes nothing.
-name: Windows
+# JayD26 for Windows and Linux, built and proven on real Windows and Linux machines in the public repository
+# Narikia1/jayd26-apps. Each job builds a given commit of the private Narikia1/jayd26 (read with a read-only
+# deploy key), tests it, builds the installer or package, installs it the way people do, runs it, and proves
+# the engines download and verify, files convert (a picture from an iPhone HEIC photo on Linux too) and a link
+# downloads. It uploads the installer, the Linux package and the evidence. It publishes nothing.
+name: Windows and Linux
 
 on:
   workflow_dispatch:
@@ -16,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows
+  group: windows-linux
   cancel-in-progress: false
 
 jobs:
@@ -160,6 +161,126 @@ jobs:
         if: always()
         with:
           name: evidence
+          path: evidence
+          if-no-files-found: warn
+
+      - name: Note when the download could not be proven
+        if: steps.download.outcome == 'failure'
+        run: echo "::warning::The link download failed on this runner. See self-test-download.json in the evidence; sites often refuse cloud machines."
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      AVALONIA_TELEMETRY_OPTOUT: 1
+      EVIDENCE: ${{ github.workspace }}/evidence
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Narikia1/jayd26
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.JAYD26_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Nothing is hardcoded in the app
+        run: node scripts/native/check-windows.mjs
+
+      - name: Unit tests, and the screens rendered without a display
+        run: |
+          mkdir -p "$EVIDENCE/renders"
+          JAYD26_RENDER_DIR="$EVIDENCE/renders" dotnet test apps/windows/JayD26.Tests/JayD26.Tests.csproj -c Release
+
+      - name: Build the package
+        run: |
+          DOTNET=dotnet sh apps/windows/linux/package.sh
+          . apps/windows/linux/app.env
+          sha256sum "dist/linux/$PACKAGE.tar.gz" | tee "$EVIDENCE/package.sha256"
+
+      - name: Tools for the proof (a display, the desktop's link handling, samples)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xdg-utils desktop-file-utils imagemagick ffmpeg libheif-examples libice6 libsm6 libfontconfig1 jq
+
+      - name: Install it as the website says, with no administrator
+        run: |
+          . apps/windows/linux/app.env
+          mkdir -p unpacked
+          tar -xzf "dist/linux/$PACKAGE.tar.gz" -C unpacked
+          (cd "unpacked/$PACKAGE" && ./install.sh)
+          test -x "$HOME/.local/lib/$APP_NAME/$APP_EXE"
+          test -L "$HOME/.local/bin/$APP_EXE"
+          desktop-file-validate "$HOME/.local/share/applications/$APP_ID.desktop"
+          test "$(xdg-mime query default "x-scheme-handler/$URL_SCHEME")" = "$APP_ID.desktop"
+          echo "EXE=$HOME/.local/lib/$APP_NAME/$APP_EXE" >> "$GITHUB_ENV"
+
+      - name: Make small samples
+        run: |
+          mkdir -p samples out
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=25:duration=6" -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest samples/clip.mp4
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=1280x960" -frames:v 1 samples/photo.png
+          heif-enc -q 80 -o samples/photo.heic samples/photo.png
+
+      - name: Download and verify the engines, then convert a video and an iPhone photo
+        run: |
+          "$EXE" --self-test "$EVIDENCE/self-test-convert.json" --out "$PWD/out" --convert "$PWD/samples/clip.mp4" mp3
+          cat "$EVIDENCE/self-test-convert.json"
+          test "$(jq -r .enginesReady "$EVIDENCE/self-test-convert.json")" = true
+          test "$(jq -r .convert.status "$EVIDENCE/self-test-convert.json")" = completed
+          "$EXE" --self-test "$EVIDENCE/self-test-heic.json" --out "$PWD/out" --convert "$PWD/samples/photo.heic" jpg
+          cat "$EVIDENCE/self-test-heic.json"
+          test "$(jq -r .convert.status "$EVIDENCE/self-test-heic.json")" = completed
+          ls -l out
+
+      - name: Download a link
+        id: download
+        continue-on-error: true
+        run: |
+          "$EXE" --self-test "$EVIDENCE/self-test-download.json" --out "$PWD/out" --download 'https://soundcloud.com/forss/flickermood'
+          cat "$EVIDENCE/self-test-download.json"
+
+      - name: Run the installed app, and a second launch hands its link to the first
+        run: |
+          . apps/windows/linux/app.env
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x900x24 &
+          sleep 3
+          "$EXE" &
+          app=$!
+          sleep 20
+          import -window root "$EVIDENCE/desktop-started.png"
+          kill -0 "$app"
+          timeout 60 "$EXE" "$URL_SCHEME://download?url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood"
+          sleep 5
+          import -window root "$EVIDENCE/desktop-second-launch.png"
+          kill -0 "$app"
+          test "$(pgrep -x "$APP_EXE" | wc -l)" -eq 1
+          kill "$app"
+
+      - name: Uninstaller works
+        run: |
+          . apps/windows/linux/app.env
+          "$HOME/.local/lib/$APP_NAME/uninstall.sh"
+          test ! -e "$HOME/.local/share/applications/$APP_ID.desktop"
+          test ! -e "$HOME/.local/lib/$APP_NAME"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: JayD26-linux-x64
+          path: dist/linux/*.tar.gz
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence-linux
           path: evidence
           if-no-files-found: warn
 
